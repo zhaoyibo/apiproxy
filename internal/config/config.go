@@ -16,6 +16,7 @@ type Config struct {
 	AllowedOrigins string // comma-separated, e.g. "http://localhost:5173"
 	OCRModel       string // VLM model used for price screenshot OCR
 	OCRAPIKey      string // upstream API key used for OCR calls
+	CookieSecure   bool   // set false for local HTTP dev (COOKIE_SECURE=false)
 }
 
 type MySQLConfig struct {
@@ -49,6 +50,7 @@ func Load() *Config {
 		AllowedOrigins: getEnv("ALLOWED_ORIGINS", ""),
 		OCRModel:       getEnv("OCR_MODEL", "claude-opus-4-8"),
 		OCRAPIKey:      getEnv("OCR_API_KEY", ""),
+		CookieSecure:   getEnv("COOKIE_SECURE", "true") != "false",
 		MySQL: MySQLConfig{
 			DSN: getEnv("MYSQL_DSN", "root:password@tcp(127.0.0.1:3306)/apiproxy?parseTime=true"),
 		},

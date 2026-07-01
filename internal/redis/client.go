@@ -97,6 +97,10 @@ func (c *Client) DeleteUsed(ctx context.Context, kc string) error {
 	return c.rdb.Del(ctx, keyUsed+kc).Err()
 }
 
+func (c *Client) SetUsed(ctx context.Context, kc string, total float64) error {
+	return c.rdb.Set(ctx, keyUsed+kc, total, 0).Err()
+}
+
 // --- price cache ---
 
 func (c *Client) GetPriceCacheRaw(ctx context.Context, model string) ([]byte, error) {

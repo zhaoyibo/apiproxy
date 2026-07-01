@@ -317,10 +317,21 @@ func (s *Store) ImportAll(ctx context.Context, keys []APIKey, dailyStats []Daily
 
 	// Insert api_keys preserving original ids (daily_stats.key_id references them).
 	for _, k := range keys {
+		createdAt, err := time.Parse(time.RFC3339, k.CreatedAt)
+		if err != nil {
+			// Fall back to the raw value and let MySQL handle it.
+			createdAt = time.Time{}
+		}
+		var createdAtVal interface{}
+		if createdAt.IsZero() {
+			createdAtVal = k.CreatedAt
+		} else {
+			createdAtVal = createdAt.UTC().Format("2006-01-02 15:04:05")
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO api_keys (id, name, key_code, parent_id, quota_cny, is_active, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, k.ID, k.Name, k.KeyCode, k.ParentID, k.QuotaCNY, k.IsActive, k.CreatedAt); err != nil {
+		`, k.ID, k.Name, k.KeyCode, k.ParentID, k.QuotaCNY, k.IsActive, createdAtVal); err != nil {
 			return fmt.Errorf("insert api_key %d: %w", k.ID, err)
 		}
 	}

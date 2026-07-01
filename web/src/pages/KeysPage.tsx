@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   listRootKeys, listChildKeys, createKey, updateKey, deleteKey, getKeyStats,
-  type APIKey, type DailyStat,
+  type APIKey,
 } from '../lib/api'
 
 export default function KeysPage() {

@@ -651,6 +651,28 @@ func (h *Handler) importConfig(c *gin.Context) {
 		h.redis.DeleteUsed(ctx, kc)   //nolint:errcheck
 	}
 
+	// Restore used_cny counters in Redis from the imported daily_stats.
+	idToKeyCode := make(map[int64]string, len(body.APIKeys))
+	for _, k := range body.APIKeys {
+		idToKeyCode[k.ID] = k.KeyCode
+	}
+	usedByKey := make(map[string]decimal.Decimal, len(body.APIKeys))
+	for _, d := range body.DailyStats {
+		kc, ok := idToKeyCode[d.KeyID]
+		if !ok {
+			continue
+		}
+		cost, err := decimal.NewFromString(d.CostCNY)
+		if err != nil {
+			continue
+		}
+		usedByKey[kc] = usedByKey[kc].Add(cost)
+	}
+	for kc, total := range usedByKey {
+		f, _ := total.Float64()
+		h.redis.SetUsed(ctx, kc, f) //nolint:errcheck
+	}
+
 	allModels := make(map[string]struct{}, len(oldModels)+len(body.ModelPrices))
 	for m := range oldModels {
 		allModels[m] = struct{}{}

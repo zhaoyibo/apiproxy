@@ -66,8 +66,9 @@ export default function ConfigPage() {
       setImportResult(result)
       // Refresh all cached queries so Keys/Prices pages show fresh data.
       qc.invalidateQueries()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '导入失败')
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string } }; message?: string }
+      setError(axiosErr?.response?.data?.error ?? axiosErr?.message ?? '导入失败')
     } finally {
       setImporting(false)
     }

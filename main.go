@@ -53,7 +53,12 @@ func main() {
 
 	// CORS: restrict to configured origins only (never wildcard for admin).
 	// Always include the Vite dev server origin so `pnpm dev` works out of the box.
-	corsOrigins := []string{"http://localhost:" + cfg.Port, "http://localhost:5173"}
+	corsOrigins := []string{
+		"http://localhost:" + cfg.Port,
+		"http://localhost:5173",
+		"http://127.0.0.1:" + cfg.Port,
+		"http://127.0.0.1:5173",
+	}
 	if cfg.AllowedOrigins != "" {
 		corsOrigins = append(corsOrigins, splitOrigins(cfg.AllowedOrigins)...)
 	}
@@ -68,8 +73,8 @@ func main() {
 	// Session-based admin auth: POST /auth/login exchanges ADMIN_KEY for a
 	// short-lived session token stored server-side (here in Redis).
 	// The browser only ever holds the opaque session token, not the raw key.
-	r.POST("/auth/login", loginHandler(cfg.AdminKey, rdb))
-	r.POST("/auth/logout", logoutHandler(rdb))
+	r.POST("/auth/login", loginHandler(cfg.AdminKey, rdb, cfg.CookieSecure))
+	r.POST("/auth/logout", logoutHandler(rdb, cfg.CookieSecure))
 
 	admin := r.Group("/admin", sessionAuth(rdb))
 	apiHandler.RegisterRoutes(admin)
@@ -175,7 +180,7 @@ func (l *loginLimiter) recordSuccess(ip string) {
 	delete(l.entries, ip)
 }
 
-func loginHandler(adminKey string, rdb *redisclient.Client) gin.HandlerFunc {
+func loginHandler(adminKey string, rdb *redisclient.Client, secure bool) gin.HandlerFunc {
 	limiter := newLoginLimiter()
 	return func(c *gin.Context) {
 		ip := c.ClientIP()
@@ -206,25 +211,24 @@ func loginHandler(adminKey string, rdb *redisclient.Client) gin.HandlerFunc {
 			return
 		}
 
-		// secure=true ensures the cookie is only sent over HTTPS.
-		// SameSite=Strict added via raw header (Gin's SetCookie does not expose it).
-		c.SetCookie(sessionCookie, token, int(sessionTTL.Seconds()), "/", "", true, true)
-		// Overwrite with SameSite appended; Gin emits a single Set-Cookie header here.
-		existing := c.Writer.Header().Get("Set-Cookie")
-		if existing != "" {
-			c.Writer.Header().Set("Set-Cookie", existing+"; SameSite=Strict")
+		c.SetCookie(sessionCookie, token, int(sessionTTL.Seconds()), "/", "", secure, true)
+		if secure {
+			existing := c.Writer.Header().Get("Set-Cookie")
+			if existing != "" {
+				c.Writer.Header().Set("Set-Cookie", existing+"; SameSite=Strict")
+			}
 		}
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	}
 }
 
-func logoutHandler(rdb *redisclient.Client) gin.HandlerFunc {
+func logoutHandler(rdb *redisclient.Client, secure bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token, err := c.Cookie(sessionCookie)
 		if err == nil {
 			rdb.DeleteSession(c.Request.Context(), token) //nolint:errcheck
 		}
-		c.SetCookie(sessionCookie, "", -1, "/", "", true, true)
+		c.SetCookie(sessionCookie, "", -1, "/", "", secure, true)
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	}
 }

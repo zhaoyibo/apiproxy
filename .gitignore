@@ -1,0 +1,17 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build output
+apiproxy
+web/dist
+web/node_modules
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp

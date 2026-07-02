@@ -447,14 +447,37 @@ func applyUsage(u *tokenUsage, data []byte) {
 		u.CacheHitTokens += usageNode.Get("cache_read_input_tokens").Int()
 	case "message_delta":
 		u.OutputTokens += usageNode.Get("output_tokens").Int()
+		// This provider puts final totals in message_delta (message_start has placeholder values).
+		// Use max so message_delta overrides a wrong message_start value without double-counting.
+		if v := usageNode.Get("input_tokens").Int(); v > u.InputTokens {
+			u.InputTokens = v
+		}
+		if v := usageNode.Get("cache_creation_input_tokens").Int(); v > u.CacheWriteTokens {
+			u.CacheWriteTokens = v
+		}
+		if v := usageNode.Get("cache_read_input_tokens").Int(); v > u.CacheHitTokens {
+			u.CacheHitTokens = v
+		}
 	default:
 		// OpenAI style
 		promptTokens := usageNode.Get("prompt_tokens").Int()
 		completionTokens := usageNode.Get("completion_tokens").Int()
 		if promptTokens > 0 || completionTokens > 0 {
-			cached := usageNode.Get("prompt_tokens_details.cached_tokens").Int()
-			u.CacheHitTokens += cached
-			u.InputTokens += promptTokens - cached
+			// Cache hit: try all known field locations across providers.
+			cacheHit := firstNonZeroInt64(
+				usageNode.Get("cache_read_tokens").Int(),                        // this provider top-level
+				usageNode.Get("prompt_tokens_details.cached_tokens").Int(),      // Alibaba Cloud / standard OpenAI
+			)
+			// Cache write: field name varies — try all known variants.
+			cacheWrite := firstNonZeroInt64(
+				usageNode.Get("cache_creation_tokens").Int(),                                            // this provider top-level
+				usageNode.Get("prompt_tokens_details.cache_creation_tokens").Int(),                      // this provider nested
+				usageNode.Get("prompt_tokens_details.cache_creation_input_tokens").Int(),                // Alibaba Cloud docs
+				usageNode.Get("prompt_tokens_details.cache_creation.cache_creation_input_tokens").Int(), // standard OpenAI
+			)
+			u.CacheHitTokens += cacheHit
+			u.CacheWriteTokens += cacheWrite
+			u.InputTokens += promptTokens - cacheHit - cacheWrite
 			u.OutputTokens += completionTokens
 			return
 		}
@@ -468,4 +491,13 @@ func applyUsage(u *tokenUsage, data []byte) {
 			u.CacheHitTokens += usageNode.Get("cache_read_input_tokens").Int()
 		}
 	}
+}
+
+func firstNonZeroInt64(vals ...int64) int64 {
+	for _, v := range vals {
+		if v != 0 {
+			return v
+		}
+	}
+	return 0
 }

@@ -40,6 +40,7 @@ export interface APIKey {
 
 export interface DailyStat {
   id: number
+  key_id: number
   date: string
   model: string
   input_tokens: number
@@ -47,6 +48,8 @@ export interface DailyStat {
   cache_write_tokens: number
   cache_hit_tokens: number
   cost_cny: string  // yuan string, e.g. "0.000000030000"
+  call_count: number
+  fail_count: number
 }
 
 export interface ModelPrice {

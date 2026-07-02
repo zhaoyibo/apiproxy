@@ -1,5 +1,6 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Eye, EyeOff, Copy, Check, Pencil, X } from 'lucide-react'
 import {
   listRootKeys, listChildKeys, createKey, updateKey, deleteKey, getKeyStats,
   type APIKey,
@@ -15,16 +16,28 @@ export default function KeysPage() {
   const [showCreateRoot, setShowCreateRoot] = useState(false)
   const [showCreateChild, setShowCreateChild] = useState(false)
 
-  const { data: rootKeys = [] } = useQuery({ queryKey: ['rootKeys'], queryFn: listRootKeys })
+  const { data: rootKeys = [] } = useQuery({ queryKey: ['rootKeys'], queryFn: listRootKeys, refetchInterval: 30_000 })
+
+  // Auto-select the first root key on initial load.
+  const autoSelected = useRef(false)
+  useEffect(() => {
+    if (!autoSelected.current && rootKeys.length > 0) {
+      autoSelected.current = true
+      setSelectedRoot(rootKeys[0])
+      setStatsKeyId(rootKeys[0].id)
+    }
+  }, [rootKeys])
   const { data: childKeys = [] } = useQuery({
     queryKey: ['childKeys', selectedRoot?.id],
     queryFn: () => listChildKeys(selectedRoot!.id),
     enabled: !!selectedRoot,
+    refetchInterval: 30_000,
   })
   const { data: stats = [] } = useQuery({
     queryKey: ['stats', statsKeyId, sevenDaysAgo, today],
     queryFn: () => getKeyStats(statsKeyId!, sevenDaysAgo, today),
     enabled: !!statsKeyId,
+    refetchInterval: 30_000,
   })
 
   const createMut = useMutation({
@@ -42,6 +55,10 @@ export default function KeysPage() {
       qc.invalidateQueries({ queryKey: ['childKeys', selectedRoot?.id] })
     },
   })
+  const renameMut = useMutation({
+    mutationFn: ({ id, name }: { id: number; name: string }) => updateKey(id, { name }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['childKeys', selectedRoot?.id] }),
+  })
   const deleteMut = useMutation({
     mutationFn: (id: number) => deleteKey(id),
     onSuccess: (_data, deletedId) => {
@@ -51,7 +68,32 @@ export default function KeysPage() {
     },
   })
 
-  const totalCost = stats.reduce((s, r) => s + parseFloat(r.cost_cny), 0)
+  const [statsTab, setStatsTab] = useState<'all' | number>('all')
+
+  const isRootStats = statsKeyId === selectedRoot?.id
+  const childKeyMap = useMemo(() =>
+    Object.fromEntries(childKeys.map(k => [k.id, k.name])),
+    [childKeys]
+  )
+
+  // Reset tab to 'all' when switching stats target.
+  useEffect(() => { setStatsTab('all') }, [statsKeyId])
+
+  const visibleStats = useMemo(() =>
+    isRootStats && statsTab !== 'all'
+      ? stats.filter(s => s.key_id === statsTab)
+      : stats,
+    [stats, isRootStats, statsTab]
+  )
+
+  // Per-child totals for tab badges.
+  const costByChild = useMemo(() => {
+    const m: Record<number, number> = {}
+    for (const s of stats) m[s.key_id] = (m[s.key_id] ?? 0) + parseFloat(s.cost_cny)
+    return m
+  }, [stats])
+
+  const totalCost = visibleStats.reduce((s, r) => s + parseFloat(r.cost_cny), 0)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
@@ -79,9 +121,9 @@ export default function KeysPage() {
                   <span style={{ fontWeight: 600, fontSize: 14 }}>{k.name}</span>
                   <ActiveBadge active={k.is_active} />
                 </div>
-                <code style={{ fontSize: 11, color: '#9ca3af', wordBreak: 'break-all', display: 'block', marginBottom: 10 }}>
-                  {k.key_code}
-                </code>
+                <div style={{ marginBottom: 10 }} onClick={e => e.stopPropagation()}>
+                  <KeyDisplay keyCode={k.key_code} />
+                </div>
                 <div style={{ display: 'flex', gap: 6 }} onClick={e => e.stopPropagation()}>
                   <Btn color="ghost" onClick={() => toggleMut.mutate({ id: k.id, isActive: !k.is_active })}>
                     {k.is_active ? '停用' : '启用'}
@@ -122,9 +164,14 @@ export default function KeysPage() {
                   <tbody>
                     {childKeys.map((k, i) => (
                       <tr key={k.id} style={{ borderTop: i === 0 ? 'none' : '1px solid #f3f4f6' }}>
-                        <td style={tdStyle}><span style={{ fontWeight: 500 }}>{k.name}</span></td>
                         <td style={tdStyle}>
-                          <code style={{ fontSize: 11, color: '#9ca3af' }}>{k.key_code}</code>
+                          <InlineEditName
+                            value={k.name}
+                            onSave={name => renameMut.mutate({ id: k.id, name })}
+                          />
+                        </td>
+                        <td style={tdStyle}>
+                          <KeyDisplay keyCode={k.key_code} />
                         </td>
                         <td style={tdStyle}>
                           {k.quota_cny === '-1' || k.quota_cny == null
@@ -135,7 +182,6 @@ export default function KeysPage() {
                         <td style={tdStyle}><ActiveBadge active={k.is_active} /></td>
                         <td style={{ ...tdStyle, whiteSpace: 'nowrap' }}>
                           <div style={{ display: 'flex', gap: 4 }}>
-                            <Btn color="ghost" onClick={() => setStatsKeyId(k.id)}>统计</Btn>
                             <Btn color="ghost" onClick={() => toggleMut.mutate({ id: k.id, isActive: !k.is_active })}>
                               {k.is_active ? '停用' : '启用'}
                             </Btn>
@@ -185,23 +231,64 @@ export default function KeysPage() {
               </>
             }
           />
+          {/* Child-key tabs (only shown for root key stats) */}
+          {isRootStats && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+              <button
+                onClick={() => setStatsTab('all')}
+                style={tabStyle(statsTab === 'all')}
+              >
+                全部
+                <span style={tabBadgeStyle(statsTab === 'all')}>
+                  ¥{stats.reduce((s, r) => s + parseFloat(r.cost_cny), 0).toFixed(4)}
+                </span>
+              </button>
+              {Object.entries(costByChild).map(([kidStr, cost]) => {
+                const kid = Number(kidStr)
+                const name = childKeyMap[kid] ?? `#${kid}`
+                return (
+                  <button key={kid} onClick={() => setStatsTab(kid)} style={tabStyle(statsTab === kid)}>
+                    {name}
+                    <span style={tabBadgeStyle(statsTab === kid)}>¥{cost.toFixed(4)}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
           <div style={{ background: '#fff', borderRadius: 10, border: '1px solid #e5e7eb', overflow: 'hidden' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
                 <tr style={{ background: '#f9fafb' }}>
-                  {['日期', '模型', '输入 Token', '输出 Token', '缓存命中', '缓存创建', '费用 (¥)'].map(h => (
+                  {[...(isRootStats && statsTab === 'all' ? ['子 Key'] : []), '日期', '模型', '成功', '失败', '输入 Token', '输出 Token', '缓存命中', '缓存创建', '费用 (¥)'].map(h => (
                     <th key={h} style={thStyle}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {stats.map((s, i) => (
+                {visibleStats.map((s, i) => (
                   <tr key={s.id} style={{ borderTop: i === 0 ? 'none' : '1px solid #f3f4f6' }}>
+                    {isRootStats && statsTab === 'all' && (
+                      <td style={tdStyle}>
+                        <span style={{ fontWeight: 500 }}>{childKeyMap[s.key_id] ?? `#${s.key_id}`}</span>
+                      </td>
+                    )}
                     <td style={tdStyle}>{s.date}</td>
                     <td style={tdStyle}><code style={{ fontSize: 12 }}>{s.model}</code></td>
+                    <td style={tdStyle}>{s.call_count.toLocaleString()}</td>
+                    <td style={{ ...tdStyle, color: s.fail_count > 0 ? '#ef4444' : undefined }}>
+                      {s.fail_count.toLocaleString()}
+                    </td>
                     <td style={tdStyle}>{s.input_tokens.toLocaleString()}</td>
                     <td style={tdStyle}>{s.output_tokens.toLocaleString()}</td>
-                    <td style={tdStyle}>{s.cache_hit_tokens.toLocaleString()}</td>
+                    <td style={tdStyle}>
+                      {s.cache_hit_tokens.toLocaleString()}
+                      {(() => {
+                        const total = s.input_tokens + s.cache_hit_tokens + s.cache_write_tokens
+                        if (total === 0) return null
+                        const rate = (s.cache_hit_tokens / total * 100).toFixed(1)
+                        return <span style={{ color: '#9ca3af', fontSize: 11, marginLeft: 4 }}>({rate}%)</span>
+                      })()}
+                    </td>
                     <td style={tdStyle}>{s.cache_write_tokens.toLocaleString()}</td>
                     <td style={{ ...tdStyle, fontWeight: 600 }}>{parseFloat(s.cost_cny).toFixed(6)}</td>
                   </tr>
@@ -313,4 +400,101 @@ const inputStyle: React.CSSProperties = {
   padding: '7px 10px', border: '1px solid #d1d5db',
   borderRadius: 6, fontSize: 13, width: '100%', boxSizing: 'border-box',
   background: '#fff',
+}
+
+function tabStyle(active: boolean): React.CSSProperties {
+  return {
+    display: 'flex', alignItems: 'center', gap: 6,
+    padding: '5px 12px', borderRadius: 9999, fontSize: 12, cursor: 'pointer',
+    border: active ? '1.5px solid #2563eb' : '1px solid #e5e7eb',
+    background: active ? '#eff6ff' : '#fff',
+    color: active ? '#2563eb' : '#374151',
+    fontWeight: active ? 600 : 400,
+  }
+}
+
+function tabBadgeStyle(active: boolean): React.CSSProperties {
+  return {
+    fontSize: 11,
+    color: active ? '#2563eb' : '#9ca3af',
+  }
+}
+
+function maskKey(key: string): string {
+  if (key.length <= 8) return '••••••••'
+  return key.slice(0, 4) + '••••••••' + key.slice(-4)
+}
+
+function KeyDisplay({ keyCode }: { keyCode: string }) {
+  const [visible, setVisible] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    navigator.clipboard.writeText(keyCode).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    })
+  }
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+      <code style={{ fontSize: 11, color: '#9ca3af', wordBreak: 'break-all', flex: 1 }}>
+        {visible ? keyCode : maskKey(keyCode)}
+      </code>
+      <button
+        onClick={e => { e.stopPropagation(); setVisible(v => !v) }}
+        title={visible ? '隐藏' : '显示'}
+        style={iconBtnStyle}
+      >
+        {visible ? <EyeOff size={13} /> : <Eye size={13} />}
+      </button>
+      <button onClick={handleCopy} title="复制" style={iconBtnStyle}>
+        {copied ? <Check size={13} color="#16a34a" /> : <Copy size={13} />}
+      </button>
+    </div>
+  )
+}
+
+const iconBtnStyle: React.CSSProperties = {
+  background: 'none', border: 'none', cursor: 'pointer',
+  padding: 3, borderRadius: 4, color: '#9ca3af',
+  display: 'flex', alignItems: 'center', flexShrink: 0,
+}
+
+function InlineEditName({ value, onSave }: { value: string; onSave: (name: string) => void }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(value)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const start = () => { setDraft(value); setEditing(true); setTimeout(() => inputRef.current?.focus(), 0) }
+  const cancel = () => setEditing(false)
+  const save = () => {
+    const trimmed = draft.trim()
+    if (trimmed && trimmed !== value) onSave(trimmed)
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <input
+          ref={inputRef}
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') cancel() }}
+          style={{ ...inputStyle, padding: '2px 6px', fontSize: 13, width: 120 }}
+        />
+        <button onClick={save} style={iconBtnStyle} title="保存"><Check size={13} color="#16a34a" /></button>
+        <button onClick={cancel} style={iconBtnStyle} title="取消"><X size={13} /></button>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+      <span style={{ fontWeight: 500 }}>{value}</span>
+      <button onClick={start} style={iconBtnStyle} title="修改名称"><Pencil size={12} /></button>
+    </div>
+  )
 }

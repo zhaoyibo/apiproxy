@@ -134,6 +134,13 @@ func (h *Handler) ServeProxy(w http.ResponseWriter, r *http.Request) {
 
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(w, resp.Body) //nolint:errcheck
+		if model != "" {
+			h.wg.Add(1)
+			go func() {
+				defer h.wg.Done()
+				h.recordFail(info, model)
+			}()
+		}
 		return
 	}
 
@@ -254,6 +261,7 @@ func (h *Handler) recordUsage(info *redis.KeyInfo, kc string, model string, usag
 		CacheWriteTokens: usage.CacheWriteTokens,
 		CacheHitTokens:   usage.CacheHitTokens,
 		CostCNY:          cost,
+		CallCount:        1,
 	}
 
 	if err := h.statsStore.Record(ctx, info.ID, entry); err != nil {
@@ -262,6 +270,15 @@ func (h *Handler) recordUsage(info *redis.KeyInfo, kc string, model string, usag
 	}
 	if err := h.redisClient.IncrUsed(ctx, kc, cost); err != nil {
 		log.Printf("incr used error: %v", err)
+	}
+}
+
+func (h *Handler) recordFail(info *redis.KeyInfo, model string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	entry := stats.UsageEntry{Model: model, FailCount: 1}
+	if err := h.statsStore.Record(ctx, info.ID, entry); err != nil {
+		log.Printf("record fail stats error: %v", err)
 	}
 }
 

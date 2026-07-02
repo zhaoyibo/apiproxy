@@ -18,6 +18,8 @@ type DailyStat struct {
 	CacheWriteTokens int64  `json:"cache_write_tokens"`
 	CacheHitTokens   int64  `json:"cache_hit_tokens"`
 	CostCNY          string `json:"cost_cny"` // unit: yuan (元), e.g. "0.0000000300"
+	CallCount        int64  `json:"call_count"`
+	FailCount        int64  `json:"fail_count"`
 }
 
 type UsageEntry struct {
@@ -27,6 +29,8 @@ type UsageEntry struct {
 	CacheWriteTokens int64
 	CacheHitTokens   int64
 	CostCNY          string // unit: yuan (元)
+	CallCount        int64
+	FailCount        int64
 }
 
 type Store struct {
@@ -40,18 +44,20 @@ func NewStore(db *sql.DB) *Store {
 func (s *Store) Record(ctx context.Context, keyID int64, entry UsageEntry) error {
 	date := time.Now().Format("2006-01-02")
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO daily_stats (key_id, date, model, input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO daily_stats (key_id, date, model, input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny, call_count, fail_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
 			input_tokens       = input_tokens       + VALUES(input_tokens),
 			output_tokens      = output_tokens      + VALUES(output_tokens),
 			cache_write_tokens = cache_write_tokens + VALUES(cache_write_tokens),
 			cache_hit_tokens   = cache_hit_tokens   + VALUES(cache_hit_tokens),
-			cost_cny           = cost_cny           + VALUES(cost_cny)
+			cost_cny           = cost_cny           + VALUES(cost_cny),
+			call_count         = call_count         + VALUES(call_count),
+			fail_count         = fail_count         + VALUES(fail_count)
 	`, keyID, date, entry.Model,
 		entry.InputTokens, entry.OutputTokens,
 		entry.CacheWriteTokens, entry.CacheHitTokens,
-		entry.CostCNY,
+		entry.CostCNY, entry.CallCount, entry.FailCount,
 	)
 	return err
 }
@@ -59,7 +65,8 @@ func (s *Store) Record(ctx context.Context, keyID int64, entry UsageEntry) error
 func (s *Store) Query(ctx context.Context, keyID int64, startDate, endDate string) ([]DailyStat, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, key_id, DATE_FORMAT(date, '%Y-%m-%d'), model,
-		       input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny
+		       input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny,
+		       call_count, fail_count
 		FROM daily_stats
 		WHERE key_id = ? AND date BETWEEN ? AND ?
 		ORDER BY date DESC, model
@@ -74,7 +81,8 @@ func (s *Store) Query(ctx context.Context, keyID int64, startDate, endDate strin
 		var s DailyStat
 		if err := rows.Scan(&s.ID, &s.KeyID, &s.Date, &s.Model,
 			&s.InputTokens, &s.OutputTokens,
-			&s.CacheWriteTokens, &s.CacheHitTokens, &s.CostCNY); err != nil {
+			&s.CacheWriteTokens, &s.CacheHitTokens, &s.CostCNY,
+			&s.CallCount, &s.FailCount); err != nil {
 			return nil, err
 		}
 		results = append(results, s)
@@ -279,7 +287,8 @@ func (s *Store) FindPrice(ctx context.Context, model string, contextLen int64) (
 func (s *Store) ListAllStats(ctx context.Context) ([]DailyStat, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, key_id, DATE_FORMAT(date, '%Y-%m-%d'), model,
-		       input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny
+		       input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny,
+		       call_count, fail_count
 		FROM daily_stats
 		ORDER BY date, key_id, model
 	`)
@@ -293,7 +302,8 @@ func (s *Store) ListAllStats(ctx context.Context) ([]DailyStat, error) {
 		var d DailyStat
 		if err := rows.Scan(&d.ID, &d.KeyID, &d.Date, &d.Model,
 			&d.InputTokens, &d.OutputTokens,
-			&d.CacheWriteTokens, &d.CacheHitTokens, &d.CostCNY); err != nil {
+			&d.CacheWriteTokens, &d.CacheHitTokens, &d.CostCNY,
+			&d.CallCount, &d.FailCount); err != nil {
 			return nil, err
 		}
 		results = append(results, d)
@@ -339,11 +349,12 @@ func (s *Store) ImportAll(ctx context.Context, keys []APIKey, dailyStats []Daily
 	// Insert daily_stats preserving original ids and key_id references.
 	for _, d := range dailyStats {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO daily_stats (id, key_id, date, model, input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO daily_stats (id, key_id, date, model, input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny, call_count, fail_count)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, d.ID, d.KeyID, d.Date, d.Model,
 			d.InputTokens, d.OutputTokens,
-			d.CacheWriteTokens, d.CacheHitTokens, d.CostCNY); err != nil {
+			d.CacheWriteTokens, d.CacheHitTokens, d.CostCNY,
+			d.CallCount, d.FailCount); err != nil {
 			return fmt.Errorf("insert daily_stat %d: %w", d.ID, err)
 		}
 	}
@@ -406,7 +417,8 @@ func (s *Store) QueryByParent(ctx context.Context, childKeyIDs []int64, startDat
 
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, key_id, DATE_FORMAT(date, '%Y-%m-%d'), model,
-		       input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny
+		       input_tokens, output_tokens, cache_write_tokens, cache_hit_tokens, cost_cny,
+		       call_count, fail_count
 		FROM daily_stats
 		WHERE key_id IN (`+placeholders+`) AND date BETWEEN ? AND ?
 		ORDER BY date DESC, key_id, model
@@ -421,7 +433,8 @@ func (s *Store) QueryByParent(ctx context.Context, childKeyIDs []int64, startDat
 		var s DailyStat
 		if err := rows.Scan(&s.ID, &s.KeyID, &s.Date, &s.Model,
 			&s.InputTokens, &s.OutputTokens,
-			&s.CacheWriteTokens, &s.CacheHitTokens, &s.CostCNY); err != nil {
+			&s.CacheWriteTokens, &s.CacheHitTokens, &s.CostCNY,
+			&s.CallCount, &s.FailCount); err != nil {
 			return nil, err
 		}
 		results = append(results, s)

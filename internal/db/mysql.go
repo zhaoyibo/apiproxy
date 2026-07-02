@@ -64,11 +64,34 @@ var tables = []string{
 )`,
 }
 
+// addColumnIfMissing adds a column to a table only if it doesn't already exist.
+func addColumnIfMissing(db *sql.DB, table, column, definition string) error {
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+		table, column,
+	).Scan(&count)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	return err
+}
+
 func Migrate(db *sql.DB) error {
 	for _, stmt := range tables {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
+	}
+	if err := addColumnIfMissing(db, "daily_stats", "call_count", "BIGINT NOT NULL DEFAULT 0 COMMENT '成功调用次数'"); err != nil {
+		return fmt.Errorf("migrate alter call_count: %w", err)
+	}
+	if err := addColumnIfMissing(db, "daily_stats", "fail_count", "BIGINT NOT NULL DEFAULT 0 COMMENT '失败调用次数'"); err != nil {
+		return fmt.Errorf("migrate alter fail_count: %w", err)
 	}
 	return nil
 }

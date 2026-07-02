@@ -119,7 +119,7 @@ func main() {
 }
 
 const sessionCookie = "admin_session"
-const sessionTTL = 8 * time.Hour
+const sessionTTL = 7 * 24 * time.Hour
 
 // loginLimiter tracks per-IP failed attempt counts for brute-force protection.
 // After maxLoginAttempts failures the IP is locked out for loginLockDuration.

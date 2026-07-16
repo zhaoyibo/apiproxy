@@ -337,41 +337,42 @@ func (h *Handler) lookupKeyInfo(ctx context.Context, kc string) (*redis.KeyInfo,
 func (h *Handler) streamResponse(w http.ResponseWriter, body io.Reader, observe bool, model string) tokenUsage {
 	flusher, canFlush := w.(http.Flusher)
 	var usage tokenUsage
-	var leftover []byte
+	var scan []byte // accumulates bytes for line-based usage parsing ONLY
 	buf := make([]byte, 4096)
 
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
-			chunk := make([]byte, len(leftover)+n)
-			copy(chunk, leftover)
-			copy(chunk[len(leftover):], buf[:n])
-			leftover = nil
-
-			lines := bytes.Split(chunk, []byte("\n"))
-			for i, line := range lines {
-				if i == len(lines)-1 && len(line) > 0 {
-					leftover = line
-					continue
+			// Forward the raw bytes VERBATIM. Never reconstruct the stream by
+			// splitting on "\n" and re-appending separators — that injects stray
+			// blank lines at read boundaries, which in SSE are event delimiters,
+			// corrupting the client's parsing (e.g. tool_use blocks leaking as
+			// text). A proxy must pass the body through byte-for-byte.
+			w.Write(buf[:n]) //nolint:errcheck
+			if canFlush {
+				flusher.Flush()
+			}
+			// Parse usage from a private copy without touching the forwarded bytes.
+			scan = append(scan, buf[:n]...)
+			for {
+				idx := bytes.IndexByte(scan, '\n')
+				if idx < 0 {
+					break
 				}
-				w.Write(line)         //nolint:errcheck
-				w.Write([]byte("\n")) //nolint:errcheck
+				line := scan[:idx]
 				parseSSEUsage(line, &usage)
 				if observe && bytes.Contains(line, []byte(`"usage"`)) {
 					log.Printf("observe %s stream usage line: %s", model, snippet(bytes.TrimSpace(line)))
 				}
-			}
-			if canFlush {
-				flusher.Flush()
+				scan = scan[idx+1:]
 			}
 		}
 		if err != nil {
 			break
 		}
 	}
-	if len(leftover) > 0 {
-		w.Write(leftover) //nolint:errcheck
-		parseSSEUsage(leftover, &usage)
+	if len(scan) > 0 {
+		parseSSEUsage(scan, &usage)
 	}
 	return usage
 }
@@ -674,11 +675,15 @@ func applyUsage(u *tokenUsage, data []byte) {
 	root := gjson.ParseBytes(data)
 	eventType := root.Get("type").String()
 
-	// Top-level usage takes precedence; fall back to message.usage for upstreams
-	// that nest it (e.g. direct Anthropic API message_start events).
+	// Top-level usage takes precedence; fall back to message.usage (Anthropic
+	// message_start events) then response.usage (OpenAI Responses API streaming,
+	// where the final response.completed event nests usage under "response").
 	usageNode := root.Get("usage")
 	if !usageNode.Exists() {
 		usageNode = root.Get("message.usage")
+	}
+	if !usageNode.Exists() {
+		usageNode = root.Get("response.usage")
 	}
 	if !usageNode.Exists() {
 		return
@@ -725,14 +730,26 @@ func applyUsage(u *tokenUsage, data []byte) {
 			u.OutputTokens += completionTokens
 			return
 		}
-		// Anthropic non-streaming
+		// input_tokens / output_tokens style (Anthropic non-streaming, or the
+		// OpenAI Responses API — including its streaming response.completed event).
 		inputTokens := usageNode.Get("input_tokens").Int()
 		outputTokens := usageNode.Get("output_tokens").Int()
 		if inputTokens > 0 || outputTokens > 0 {
-			u.InputTokens += inputTokens
+			if d := usageNode.Get("input_tokens_details"); d.Exists() {
+				// Responses API (and image models): input_tokens is the TOTAL and
+				// already includes cached tokens — split the cached part out so it
+				// bills at the cache-hit rate rather than the input rate.
+				cached := d.Get("cached_tokens").Int()
+				u.CacheHitTokens += cached
+				u.InputTokens += inputTokens - cached
+			} else {
+				// Anthropic non-streaming: input_tokens excludes cache; cache is
+				// reported in its own fields.
+				u.InputTokens += inputTokens
+				u.CacheWriteTokens += usageNode.Get("cache_creation_input_tokens").Int()
+				u.CacheHitTokens += usageNode.Get("cache_read_input_tokens").Int()
+			}
 			u.OutputTokens += outputTokens
-			u.CacheWriteTokens += usageNode.Get("cache_creation_input_tokens").Int()
-			u.CacheHitTokens += usageNode.Get("cache_read_input_tokens").Int()
 		}
 	}
 }

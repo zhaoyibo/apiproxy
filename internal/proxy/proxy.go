@@ -2,12 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,16 +33,26 @@ type Handler struct {
 	exhaustedStatuses map[int]bool
 	exhaustedPatterns []string       // lowercase substrings
 	billingLoc        *time.Location // timezone for the monthly exhaustion reset
+	observeModels     map[string]bool
+	observeAll        bool
 	wg                sync.WaitGroup
 }
 
-func NewHandler(r *redis.Client, s *stats.Store, proxyURL string, exhaustedStatuses []int, exhaustedPatterns []string, billingLoc *time.Location) *Handler {
+func NewHandler(r *redis.Client, s *stats.Store, proxyURL string, exhaustedStatuses []int, exhaustedPatterns []string, billingLoc *time.Location, observeModels []string) *Handler {
 	statusSet := make(map[int]bool, len(exhaustedStatuses))
 	for _, code := range exhaustedStatuses {
 		statusSet[code] = true
 	}
 	if billingLoc == nil {
 		billingLoc = time.Local
+	}
+	observeSet := make(map[string]bool, len(observeModels))
+	observeAll := false
+	for _, m := range observeModels {
+		if m == "*" {
+			observeAll = true
+		}
+		observeSet[m] = true
 	}
 	return &Handler{
 		redisClient:       r,
@@ -47,10 +61,18 @@ func NewHandler(r *redis.Client, s *stats.Store, proxyURL string, exhaustedStatu
 		exhaustedStatuses: statusSet,
 		exhaustedPatterns: exhaustedPatterns,
 		billingLoc:        billingLoc,
+		observeModels:     observeSet,
+		observeAll:        observeAll,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Minute,
 		},
 	}
+}
+
+// isObserved reports whether a model is in observe mode (allowed through without
+// pricing, response structure logged).
+func (h *Handler) isObserved(model string) bool {
+	return h.observeAll || h.observeModels[strings.ToLower(model)]
 }
 
 // Shutdown waits for all in-flight recordUsage goroutines to finish.
@@ -107,10 +129,21 @@ func (h *Handler) ServeProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	model := extractModel(body)
+	if model == "" {
+		// Image edits etc. upload multipart/form-data — the model is a form field,
+		// not JSON. Extract it so observe/billing engage for those too.
+		model = extractMultipartModel(r.Header.Get("Content-Type"), body)
+	}
 	if model != "" {
 		if configured, err := h.modelHasPrices(ctx, model); err != nil || !configured {
-			http.Error(w, `{"error":"model `+model+` is not configured for billing; please contact the administrator to add pricing"}`, http.StatusPaymentRequired)
-			return
+			// Observe mode: let the model through unpriced so its response can be
+			// studied; otherwise enforce the billing gate.
+			if h.isObserved(model) {
+				log.Printf("observe: model %q has no pricing, passing through (no billing)", model)
+			} else {
+				http.Error(w, `{"error":"model `+model+` is not configured for billing; please contact the administrator to add pricing"}`, http.StatusPaymentRequired)
+				return
+			}
 		}
 	}
 
@@ -175,11 +208,12 @@ func (h *Handler) ServeProxy(w http.ResponseWriter, r *http.Request) {
 			h.recordFailAsync(info, model)
 			return
 		}
+		observe := h.isObserved(model)
 		var usage tokenUsage
 		if isStream {
-			usage = h.streamResponse(w, resp.Body)
+			usage = h.streamResponse(w, resp.Body, observe, model)
 		} else {
-			usage = h.bufferedResponse(w, resp.Body)
+			usage = h.bufferedResponse(w, resp.Body, observe, model)
 		}
 		if model != "" {
 			h.wg.Add(1)
@@ -300,7 +334,7 @@ func (h *Handler) lookupKeyInfo(ctx context.Context, kc string) (*redis.KeyInfo,
 	return &built, nil
 }
 
-func (h *Handler) streamResponse(w http.ResponseWriter, body io.Reader) tokenUsage {
+func (h *Handler) streamResponse(w http.ResponseWriter, body io.Reader, observe bool, model string) tokenUsage {
 	flusher, canFlush := w.(http.Flusher)
 	var usage tokenUsage
 	var leftover []byte
@@ -323,6 +357,9 @@ func (h *Handler) streamResponse(w http.ResponseWriter, body io.Reader) tokenUsa
 				w.Write(line)         //nolint:errcheck
 				w.Write([]byte("\n")) //nolint:errcheck
 				parseSSEUsage(line, &usage)
+				if observe && bytes.Contains(line, []byte(`"usage"`)) {
+					log.Printf("observe %s stream usage line: %s", model, snippet(bytes.TrimSpace(line)))
+				}
 			}
 			if canFlush {
 				flusher.Flush()
@@ -339,13 +376,67 @@ func (h *Handler) streamResponse(w http.ResponseWriter, body io.Reader) tokenUsa
 	return usage
 }
 
-func (h *Handler) bufferedResponse(w http.ResponseWriter, body io.Reader) tokenUsage {
+func (h *Handler) bufferedResponse(w http.ResponseWriter, body io.Reader, observe bool, model string) tokenUsage {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return tokenUsage{}
 	}
 	w.Write(data) //nolint:errcheck
-	return parseBodyUsage(data)
+	// Forward the original bytes untouched above; parse/inspect a decompressed
+	// copy so gzipped responses (common for large image payloads) still yield
+	// correct token usage.
+	parsed := maybeGunzip(data)
+	if observe {
+		logObservedResponse(model, parsed)
+	}
+	return parseBodyUsage(parsed)
+}
+
+// maybeGunzip returns data decompressed if it is gzip-framed, else data unchanged.
+func maybeGunzip(data []byte) []byte {
+	if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
+		return data
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return data
+	}
+	defer zr.Close()
+	dec, err := io.ReadAll(io.LimitReader(zr, maxRequestBodySize))
+	if err != nil {
+		return data
+	}
+	return dec
+}
+
+// logObservedResponse logs the shape of an observed model's JSON response — the
+// raw usage object, the top-level field names, and the data[] length (image
+// count) — without dumping response payloads such as base64 image data. The
+// caller passes already-decompressed data.
+func logObservedResponse(model string, data []byte) {
+	if !gjson.ValidBytes(data) {
+		n := len(data)
+		if n > 32 {
+			n = 32
+		}
+		log.Printf("observe %s: non-JSON response (%d bytes) first-bytes-hex=%x", model, len(data), data[:n])
+		return
+	}
+	root := gjson.ParseBytes(data)
+	var keys []string
+	root.ForEach(func(k, _ gjson.Result) bool {
+		keys = append(keys, k.String())
+		return true
+	})
+	usage := root.Get("usage").Raw
+	if usage == "" {
+		usage = "(none)"
+	}
+	dataCount := "n/a"
+	if d := root.Get("data"); d.IsArray() {
+		dataCount = strconv.Itoa(len(d.Array()))
+	}
+	log.Printf("observe %s: top_keys=%v data_count=%s usage=%s", model, keys, dataCount, usage)
 }
 
 func (h *Handler) recordUsage(info *redis.KeyInfo, kc string, model string, usage tokenUsage) {
@@ -355,6 +446,23 @@ func (h *Handler) recordUsage(info *redis.KeyInfo, kc string, model string, usag
 	contextLen := usage.InputTokens + usage.CacheWriteTokens + usage.CacheHitTokens
 	price, err := h.findPrice(ctx, model, contextLen)
 	if err != nil {
+		// Observe mode: no price configured, but still persist the usage with
+		// zero cost so the model's calls/tokens show up in stats for study.
+		if h.isObserved(model) {
+			entry := stats.UsageEntry{
+				Model:            model,
+				InputTokens:      usage.InputTokens,
+				OutputTokens:     usage.OutputTokens,
+				CacheWriteTokens: usage.CacheWriteTokens,
+				CacheHitTokens:   usage.CacheHitTokens,
+				CostCNY:          "0",
+				CallCount:        1,
+			}
+			if rerr := h.statsStore.Record(ctx, info.ID, entry); rerr != nil {
+				log.Printf("observe record stats error (%s): %v", model, rerr)
+			}
+			return
+		}
 		log.Printf("no price for model %s: %v", model, err)
 		return
 	}
@@ -498,6 +606,35 @@ func extractModel(body []byte) string {
 	}
 	json.Unmarshal(body, &req) //nolint:errcheck
 	return req.Model
+}
+
+// extractMultipartModel pulls the "model" form field out of a multipart/form-data
+// body (used by image edits etc.) without reading uploaded file parts into memory.
+func extractMultipartModel(contentType string, body []byte) string {
+	if !strings.HasPrefix(contentType, "multipart/") {
+		return ""
+	}
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return ""
+	}
+	boundary := params["boundary"]
+	if boundary == "" {
+		return ""
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		p, err := mr.NextPart()
+		if err != nil {
+			return ""
+		}
+		if p.FormName() == "model" && p.FileName() == "" {
+			val, _ := io.ReadAll(io.LimitReader(p, 256))
+			p.Close() //nolint:errcheck
+			return strings.TrimSpace(string(val))
+		}
+		p.Close() //nolint:errcheck
+	}
 }
 
 func isStreamingRequest(body []byte) bool {

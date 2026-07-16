@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Eye, EyeOff, Copy, Check, Pencil, X, ArrowUp, ArrowDown } from 'lucide-react'
+import { Eye, EyeOff, Copy, Check, Pencil, X, ArrowUp, ArrowDown, ChevronDown, ChevronRight } from 'lucide-react'
 import {
   listRootKeys, listAllChildKeys, createKey, updateKey, deleteKey, clearExhausted, getAllStats,
   setRootChildren,
   type APIKey,
 } from '../lib/api'
 
-type DateRangeKey = '7d' | '30d' | 'thisMonth' | 'lastMonth'
+type DateRangeKey = 'today' | '24h' | '7d' | '30d' | 'thisMonth' | 'lastMonth'
 
 const dateRangeOptions: { key: DateRangeKey; label: string }[] = [
+  { key: 'today', label: '今天' },
+  { key: '24h', label: '近24h' },
   { key: '7d', label: '近7天' },
   { key: '30d', label: '近30天' },
   { key: 'thisMonth', label: '本月' },
@@ -24,6 +26,11 @@ function computeDateRange(key: DateRangeKey): { start: string; end: string } {
   const now = new Date()
   const today = toDateStr(now)
   switch (key) {
+    case 'today':
+      return { start: today, end: today }
+    case '24h':
+      // daily_stats is day-granular; approximate the last 24h as yesterday+today.
+      return { start: toDateStr(new Date(now.getTime() - 86400_000)), end: today }
     case '7d':
       return { start: toDateStr(new Date(now.getTime() - 7 * 86400_000)), end: today }
     case '30d':
@@ -40,7 +47,7 @@ function computeDateRange(key: DateRangeKey): { start: string; end: string } {
 
 export default function KeysPage() {
   const qc = useQueryClient()
-  const [dateRange, setDateRange] = useState<DateRangeKey>('7d')
+  const [dateRange, setDateRange] = useState<DateRangeKey>('today')
   // Recompute on every render so "今天" stays fresh if the page is left open overnight.
   const { start: rangeStart, end: rangeEnd } = computeDateRange(dateRange)
 
@@ -48,6 +55,8 @@ export default function KeysPage() {
   const [showCreateChild, setShowCreateChild] = useState(false)
   const [editingChildId, setEditingChildId] = useState<number | null>(null)
   const [linkingRootId, setLinkingRootId] = useState<number | null>(null)
+  const [rootsCollapsed, setRootsCollapsed] = useState(true)
+  const [childrenCollapsed, setChildrenCollapsed] = useState(true)
   const [statsTab, setStatsTab] = useState<'all' | number>('all')
 
   const { data: rootKeys = [] } = useQuery({ queryKey: ['rootKeys'], queryFn: listRootKeys, refetchInterval: 30_000 })
@@ -110,7 +119,19 @@ export default function KeysPage() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
       {/* Root keys */}
       <div>
-        <SectionHeader title="主 Key" action={<Btn color="blue" onClick={() => setShowCreateRoot(true)}>+ 新建主 Key</Btn>} />
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <h2
+            onClick={() => setRootsCollapsed(v => !v)}
+            style={{ margin: 0, fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', userSelect: 'none' }}
+          >
+            {rootsCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+            主 Key
+            <span style={{ color: '#9ca3af', fontWeight: 400, fontSize: 13 }}>（{rootKeys.length}）</span>
+          </h2>
+          <Btn color="blue" onClick={() => { setRootsCollapsed(false); setShowCreateRoot(true) }}>+ 新建主 Key</Btn>
+        </div>
+        {!rootsCollapsed && (
+        <>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 10 }}>
           {rootKeys.map(k => (
             <div key={k.id} style={{ background: '#fff', borderRadius: 10, border: '1px solid #e5e7eb', padding: '12px 14px' }}>
@@ -151,14 +172,25 @@ export default function KeysPage() {
             />
           </div>
         )}
+        </>
+        )}
       </div>
 
       {/* Child keys */}
       <div>
-        <SectionHeader
-          title="子 Key"
-          action={<Btn color="blue" onClick={() => { setShowCreateChild(true); setEditingChildId(null) }}>+ 新建子 Key</Btn>}
-        />
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <h2
+            onClick={() => setChildrenCollapsed(v => !v)}
+            style={{ margin: 0, fontSize: 15, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', userSelect: 'none' }}
+          >
+            {childrenCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+            子 Key
+            <span style={{ color: '#9ca3af', fontWeight: 400, fontSize: 13 }}>（{childKeys.length}）</span>
+          </h2>
+          <Btn color="blue" onClick={() => { setChildrenCollapsed(false); setShowCreateChild(true); setEditingChildId(null) }}>+ 新建子 Key</Btn>
+        </div>
+        {!childrenCollapsed && (
+        <>
         {(showCreateChild || editingChild) && (
           <div style={{ marginBottom: 12, maxWidth: 520 }}>
             <ChildKeyForm
@@ -229,6 +261,8 @@ export default function KeysPage() {
             </tbody>
           </table>
         </div>
+        </>
+        )}
       </div>
 
       {/* Stats */}

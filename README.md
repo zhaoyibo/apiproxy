@@ -68,6 +68,9 @@ POST /v1/chat/completions  # OpenAI
 
 Authenticate with a sub-key via `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
 
+Image models (gpt-image-2 / gpt-image-2-edits) have provider-specific request,
+response, and pricing shapes — see [`docs/image-models.md`](docs/image-models.md).
+
 ## Schema
 
 See [`schema.sql`](schema.sql) — three tables: `api_keys`, `daily_stats`, `model_prices`.

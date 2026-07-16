@@ -31,6 +31,12 @@ type Config struct {
 	// BillingLocation is the timezone whose natural-month boundary resets a root
 	// key's exhaustion flag. Should match the upstream provider's billing TZ.
 	BillingLocation *time.Location
+
+	// ObserveModels lists models allowed through WITHOUT a configured price (the
+	// 402 billing gate is skipped) so their responses can be logged for study.
+	// "*" observes every model. Empty (default) = observe nothing; billing gate
+	// enforced as usual. For inspection only — no cost is recorded.
+	ObserveModels []string
 }
 
 type MySQLConfig struct {
@@ -68,6 +74,7 @@ func Load() *Config {
 		ExhaustedStatuses: parseIntList(getEnv("UPSTREAM_EXHAUSTED_STATUS", "429,403")),
 		ExhaustedPatterns: parseLowerList(getEnv("UPSTREAM_EXHAUSTED_PATTERNS", "quota,insufficient,exceeded,余额,额度,欠费,balance,arrears")),
 		BillingLocation:   loadLocation(getEnv("BILLING_TIMEZONE", "Asia/Shanghai")),
+		ObserveModels:     parseLowerList(getEnv("OBSERVE_MODELS", "")),
 		MySQL: MySQLConfig{
 			DSN: getEnv("MYSQL_DSN", "root:password@tcp(127.0.0.1:3306)/apiproxy?parseTime=true"),
 		},

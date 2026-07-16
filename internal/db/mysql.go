@@ -48,6 +48,13 @@ var tables = []string{
   PRIMARY KEY (id),
   UNIQUE INDEX idx_key_date_model (key_id, date, model)
 )`,
+	`CREATE TABLE IF NOT EXISTS key_parents (
+  child_id  BIGINT NOT NULL                    COMMENT '子 Key ID（api_keys.id）',
+  root_id   BIGINT NOT NULL                    COMMENT '主 Key ID（api_keys.id）',
+  priority  INT    NOT NULL DEFAULT 0           COMMENT '优先级，越小越优先',
+  PRIMARY KEY (child_id, root_id),
+  INDEX idx_child (child_id)
+)`,
 	`CREATE TABLE IF NOT EXISTS model_prices (
   id              BIGINT         NOT NULL AUTO_INCREMENT               COMMENT '主键',
   model           VARCHAR(100)   NOT NULL DEFAULT ''                   COMMENT '模型名称',
@@ -92,6 +99,14 @@ func Migrate(db *sql.DB) error {
 	}
 	if err := addColumnIfMissing(db, "daily_stats", "fail_count", "BIGINT NOT NULL DEFAULT 0 COMMENT '失败调用次数'"); err != nil {
 		return fmt.Errorf("migrate alter fail_count: %w", err)
+	}
+	// Backfill key_parents from the legacy single parent_id binding so existing
+	// child keys keep working after the switch to many-to-many. Idempotent via PK.
+	if _, err := db.Exec(`
+		INSERT IGNORE INTO key_parents (child_id, root_id, priority)
+		SELECT id, parent_id, 0 FROM api_keys WHERE parent_id != -1
+	`); err != nil {
+		return fmt.Errorf("migrate backfill key_parents: %w", err)
 	}
 	return nil
 }

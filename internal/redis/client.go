@@ -16,20 +16,33 @@ type Client struct {
 	rdb *rdb.Client
 }
 
+// ParentRef pairs a root key's id with its key_code for the proxy failover list.
+type ParentRef struct {
+	RootID  int64  `json:"root_id"`
+	KeyCode string `json:"key_code"` // upstream key_code to forward with
+}
+
+// KeyInfoSchema is the current KeyInfo cache-format version. Bump it whenever the
+// cached shape changes so lookups can tell an authoritative entry from a stale
+// one written by an older binary (which unmarshals to V == 0 and is re-derived).
+const KeyInfoSchema = 1
+
 // KeyInfo is the minimal proxy-side view of a sub-key, cached under key:code:{key_code}.
 // It contains everything the proxy needs per request without hitting MySQL.
 type KeyInfo struct {
-	ID            int64  `json:"id"`
-	IsActive      bool   `json:"is_active"`
-	QuotaCNY      string `json:"quota_cny"`       // unit: yuan (元); "-1" = unlimited
-	ParentKeyCode string `json:"parent_key_code"` // upstream key_code to forward with
+	V        int         `json:"v,omitempty"` // cache-format version; see KeyInfoSchema
+	ID       int64       `json:"id"`
+	IsActive bool        `json:"is_active"`
+	QuotaCNY string      `json:"quota_cny"` // unit: yuan (元); "-1" = unlimited
+	Parents  []ParentRef `json:"parents"`   // upstream roots to try, in priority order
 }
 
 const (
-	keyCode       = "key:code:"    // STRING key:code:{key_code}  -> JSON KeyInfo
-	keyUsed       = "key:used:"    // STRING key:used:{key_code}  -> float64
-	priceKey      = "price:model:" // STRING price:model:{model}  -> JSON []ModelPrice
-	sessionPrefix = "session:"     // STRING session:{token}      -> "1"
+	keyCode       = "key:code:"      // STRING key:code:{key_code}   -> JSON KeyInfo
+	keyUsed       = "key:used:"      // STRING key:used:{key_code}   -> float64
+	keyExhausted  = "key:exhausted:" // STRING key:exhausted:{rootID} -> "1" (TTL to month end)
+	priceKey      = "price:model:"   // STRING price:model:{model}   -> JSON []ModelPrice
+	sessionPrefix = "session:"       // STRING session:{token}       -> "1"
 )
 
 const priceCacheTTL = 5 * time.Minute
@@ -99,6 +112,24 @@ func (c *Client) DeleteUsed(ctx context.Context, kc string) error {
 
 func (c *Client) SetUsed(ctx context.Context, kc string, total float64) error {
 	return c.rdb.Set(ctx, keyUsed+kc, total, 0).Err()
+}
+
+// --- root key exhaustion (keyed by root id, TTL to natural-month boundary) ---
+
+func (c *Client) MarkRootExhausted(ctx context.Context, rootID int64, ttl time.Duration) error {
+	return c.rdb.Set(ctx, keyExhausted+strconv.FormatInt(rootID, 10), "1", ttl).Err()
+}
+
+func (c *Client) IsRootExhausted(ctx context.Context, rootID int64) (bool, error) {
+	n, err := c.rdb.Exists(ctx, keyExhausted+strconv.FormatInt(rootID, 10)).Result()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+func (c *Client) ClearRootExhausted(ctx context.Context, rootID int64) error {
+	return c.rdb.Del(ctx, keyExhausted+strconv.FormatInt(rootID, 10)).Err()
 }
 
 // --- price cache ---

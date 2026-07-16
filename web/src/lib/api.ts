@@ -36,6 +36,8 @@ export interface APIKey {
   used_cny: string    // yuan string, e.g. "0.000000030000"
   is_active: boolean
   created_at: string
+  root_ids?: number[] // child key: bound root ids in priority order
+  exhausted?: boolean // root key: current-month upstream exhaustion flag
 }
 
 export interface DailyStat {
@@ -65,12 +67,19 @@ export interface ModelPrice {
 
 export const listRootKeys = () => client.get<APIKey[]>('/keys').then(r => r.data)
 export const listChildKeys = (id: number) => client.get<APIKey[]>(`/keys/${id}/children`).then(r => r.data)
+export const listAllChildKeys = () => client.get<APIKey[]>('/child-keys').then(r => r.data)
 export const createKey = (data: Partial<APIKey>) => client.post<APIKey>('/keys', data).then(r => r.data)
 export const updateKey = (id: number, data: Partial<APIKey>) => client.put<APIKey>(`/keys/${id}`, data).then(r => r.data)
 export const deleteKey = (id: number) => client.delete(`/keys/${id}`)
+export const clearExhausted = (id: number) => client.post(`/keys/${id}/clear-exhausted`)
+export const setRootChildren = (rootId: number, childIds: number[]) =>
+  client.put(`/keys/${rootId}/children`, { child_ids: childIds })
 
 export const getKeyStats = (id: number, start: string, end: string) =>
   client.get<DailyStat[]>(`/keys/${id}/stats`, { params: { start, end } }).then(r => r.data)
+
+export const getAllStats = (start: string, end: string) =>
+  client.get<DailyStat[]>('/stats/all', { params: { start, end } }).then(r => r.data)
 
 export const listPrices = () => client.get<Record<string, ModelPrice[]>>('/prices').then(r => r.data)
 export const setPrices = (model: string, prices: ModelPrice[]) =>

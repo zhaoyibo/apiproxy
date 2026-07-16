@@ -46,7 +46,7 @@ func main() {
 	}
 
 	statsStore := stats.NewStore(mysql)
-	proxyHandler := proxy.NewHandler(rdb, statsStore, cfg.ProxyURL)
+	proxyHandler := proxy.NewHandler(rdb, statsStore, cfg.ProxyURL, cfg.ExhaustedStatuses, cfg.ExhaustedPatterns, cfg.BillingLocation)
 	apiHandler := api.NewHandler(rdb, statsStore, cfg.OCRModel, cfg.OCRAPIKey, cfg.ProxyURL)
 
 	r := gin.Default()

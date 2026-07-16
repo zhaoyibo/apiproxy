@@ -94,14 +94,30 @@ func (s *Store) Query(ctx context.Context, keyID int64, startDate, endDate strin
 // ParentID == -1 means root key; QuotaCNY == "-1" means unlimited.
 
 type APIKey struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	KeyCode   string `json:"key_code"`
-	ParentID  int64  `json:"parent_id"`  // -1 = root key
-	QuotaCNY  string `json:"quota_cny"`  // "-1" = unlimited; unit: yuan (元)
-	UsedCNY   string `json:"used_cny"`   // unit: yuan (元); from Redis, not stored in DB
-	IsActive  bool   `json:"is_active"`
-	CreatedAt string `json:"created_at"`
+	ID        int64   `json:"id"`
+	Name      string  `json:"name"`
+	KeyCode   string  `json:"key_code"`
+	ParentID  int64   `json:"parent_id"`          // -1 = root key; for child keys = primary (highest-priority) root, routing真源是 key_parents
+	QuotaCNY  string  `json:"quota_cny"`          // "-1" = unlimited; unit: yuan (元)
+	UsedCNY   string  `json:"used_cny"`           // unit: yuan (元); from Redis, not stored in DB
+	IsActive  bool    `json:"is_active"`
+	CreatedAt string  `json:"created_at"`
+	RootIDs   []int64 `json:"root_ids,omitempty"` // child key: bound root ids in priority order; not persisted on api_keys
+	Exhausted bool    `json:"exhausted,omitempty"` // root key: current-month upstream exhaustion flag; not persisted
+}
+
+// ParentRef pairs a root key's id with its key_code, used to warm the proxy cache
+// with an ordered failover list.
+type ParentRef struct {
+	RootID  int64
+	KeyCode string
+}
+
+// KeyParent is one row of the key_parents join table (child↔root, ordered).
+type KeyParent struct {
+	ChildID  int64 `json:"child_id"`
+	RootID   int64 `json:"root_id"`
+	Priority int   `json:"priority"`
 }
 
 func (s *Store) CreateKey(ctx context.Context, k *APIKey) error {
@@ -141,9 +157,231 @@ func (s *Store) UpdateKey(ctx context.Context, k *APIKey) error {
 	return err
 }
 
+// DeleteKey removes a single key row and all of its bindings. It does NOT
+// cascade to child keys: deleting a root key merely unbinds it from children
+// (a child may still be bound to other roots). Deleting a child removes its
+// bindings. The caller is responsible for invalidating affected Redis caches.
 func (s *Store) DeleteKey(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM api_keys WHERE id = ? OR parent_id = ?`, id, id)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.ExecContext(ctx, `DELETE FROM key_parents WHERE child_id = ? OR root_id = ?`, id, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM api_keys WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SetChildParents replaces a child key's bound roots with the given ordered list
+// (index = priority) and syncs api_keys.parent_id to the primary (first) root
+// for backward-compatible reads.
+func (s *Store) SetChildParents(ctx context.Context, childID int64, rootIDs []int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.ExecContext(ctx, `DELETE FROM key_parents WHERE child_id = ?`, childID); err != nil {
+		return err
+	}
+	for i, rootID := range rootIDs {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO key_parents (child_id, root_id, priority) VALUES (?, ?, ?)`,
+			childID, rootID, i,
+		); err != nil {
+			return err
+		}
+	}
+	if len(rootIDs) > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET parent_id = ? WHERE id = ?`, rootIDs[0], childID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SetRootChildren reconciles which child keys are bound to the given root:
+// children in childIDs but not yet bound get this root appended at the lowest
+// priority; children currently bound but absent from childIDs get it removed.
+// Other roots' bindings and their order are left untouched. Each affected child's
+// parent_id is re-synced to its remaining top-priority root. Returns the ids of
+// children whose bindings changed (for cache invalidation).
+func (s *Store) SetRootChildren(ctx context.Context, rootID int64, childIDs []int64) ([]int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	rows, err := tx.QueryContext(ctx, `SELECT child_id FROM key_parents WHERE root_id = ?`, rootID)
+	if err != nil {
+		return nil, err
+	}
+	current := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		current[id] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	desired := make(map[int64]bool, len(childIDs))
+	for _, id := range childIDs {
+		desired[id] = true
+	}
+
+	var affected []int64
+	// Adds: append this root at the lowest priority for that child.
+	for id := range desired {
+		if current[id] {
+			continue
+		}
+		var maxPr sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT MAX(priority) FROM key_parents WHERE child_id = ?`, id).Scan(&maxPr); err != nil {
+			return nil, err
+		}
+		pr := 0
+		if maxPr.Valid {
+			pr = int(maxPr.Int64) + 1
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO key_parents (child_id, root_id, priority) VALUES (?, ?, ?)`, id, rootID, pr); err != nil {
+			return nil, err
+		}
+		affected = append(affected, id)
+	}
+	// Removes.
+	for id := range current {
+		if desired[id] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM key_parents WHERE child_id = ? AND root_id = ?`, id, rootID); err != nil {
+			return nil, err
+		}
+		affected = append(affected, id)
+	}
+	// Re-sync parent_id for affected children to their current top-priority root.
+	for _, id := range affected {
+		var top int64
+		err := tx.QueryRowContext(ctx, `SELECT root_id FROM key_parents WHERE child_id = ? ORDER BY priority LIMIT 1`, id).Scan(&top)
+		if err == sql.ErrNoRows {
+			continue // no bindings left; leave parent_id (stays != -1 so it's still a child)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET parent_id = ? WHERE id = ?`, top, id); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return affected, nil
+}
+
+// GetChildParents returns the child's bound root ids ordered by priority.
+func (s *Store) GetChildParents(ctx context.Context, childID int64) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT root_id FROM key_parents WHERE child_id = ? ORDER BY priority`, childID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// GetChildParentRefs returns the child's bound roots (id + key_code) ordered by
+// priority, skipping inactive roots. Used to warm the proxy failover cache.
+func (s *Store) GetChildParentRefs(ctx context.Context, childID int64) ([]ParentRef, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT r.id, r.key_code
+		FROM key_parents kp
+		JOIN api_keys r ON r.id = kp.root_id
+		WHERE kp.child_id = ? AND r.is_active = 1
+		ORDER BY kp.priority
+	`, childID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	refs := []ParentRef{}
+	for rows.Next() {
+		var ref ParentRef
+		if err := rows.Scan(&ref.RootID, &ref.KeyCode); err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
+
+// ListChildIDsByRoot returns the ids of all child keys bound to the given root.
+func (s *Store) ListChildIDsByRoot(ctx context.Context, rootID int64) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT child_id FROM key_parents WHERE root_id = ?`, rootID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ListAllKeyParents returns every child↔root binding (for config export).
+func (s *Store) ListAllKeyParents(ctx context.Context) ([]KeyParent, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT child_id, root_id, priority FROM key_parents ORDER BY child_id, priority`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []KeyParent{}
+	for rows.Next() {
+		var kp KeyParent
+		if err := rows.Scan(&kp.ChildID, &kp.RootID, &kp.Priority); err != nil {
+			return nil, err
+		}
+		result = append(result, kp)
+	}
+	return result, rows.Err()
+}
+
+// ListAllChildKeys returns every child key (parent_id != -1) as a flat list.
+func (s *Store) ListAllChildKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, key_code, parent_id, quota_cny, is_active, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%sZ')
+		FROM api_keys WHERE parent_id != -1 ORDER BY created_at
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanKeys(rows)
 }
 
 func (s *Store) ListRootKeys(ctx context.Context) ([]APIKey, error) {
@@ -311,7 +549,7 @@ func (s *Store) ListAllStats(ctx context.Context) ([]DailyStat, error) {
 	return results, rows.Err()
 }
 
-func (s *Store) ImportAll(ctx context.Context, keys []APIKey, dailyStats []DailyStat, prices map[string][]ModelPrice) error {
+func (s *Store) ImportAll(ctx context.Context, keys []APIKey, dailyStats []DailyStat, prices map[string][]ModelPrice, keyParents []KeyParent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -319,7 +557,7 @@ func (s *Store) ImportAll(ctx context.Context, keys []APIKey, dailyStats []Daily
 	defer tx.Rollback() //nolint:errcheck
 
 	// Clear all tables — order matters due to logical dependencies.
-	for _, tbl := range []string{"daily_stats", "api_keys", "model_prices"} {
+	for _, tbl := range []string{"key_parents", "daily_stats", "api_keys", "model_prices"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+tbl); err != nil {
 			return fmt.Errorf("clear %s: %w", tbl, err)
 		}
@@ -369,6 +607,23 @@ func (s *Store) ImportAll(ctx context.Context, keys []APIKey, dailyStats []Daily
 				p.InputCNY, p.OutputCNY, p.CacheHitCNY, p.CacheWriteCNY); err != nil {
 				return fmt.Errorf("insert model_price %s: %w", p.Model, err)
 			}
+		}
+	}
+
+	// Insert key_parents bindings. If the export predates many-to-many (none
+	// provided), backfill from each child key's legacy parent_id.
+	if len(keyParents) == 0 {
+		for _, k := range keys {
+			if k.ParentID != -1 {
+				keyParents = append(keyParents, KeyParent{ChildID: k.ID, RootID: k.ParentID, Priority: 0})
+			}
+		}
+	}
+	for _, kp := range keyParents {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO key_parents (child_id, root_id, priority) VALUES (?, ?, ?)
+		`, kp.ChildID, kp.RootID, kp.Priority); err != nil {
+			return fmt.Errorf("insert key_parent %d->%d: %w", kp.ChildID, kp.RootID, err)
 		}
 	}
 

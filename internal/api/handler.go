@@ -55,8 +55,15 @@ func (h *Handler) RegisterRoutes(rg *gin.RouterGroup) {
 		keys.PUT("/:id", h.updateKey)
 		keys.DELETE("/:id", h.deleteKey)
 		keys.GET("/:id/children", h.listChildren)
+		keys.PUT("/:id/children", h.setRootChildren)
 		keys.GET("/:id/stats", h.keyStats)
+		keys.POST("/:id/clear-exhausted", h.clearExhausted)
 	}
+
+	// Flat child-key list and global stats (kept off /keys to avoid a static-vs-param
+	// route conflict with /keys/:id).
+	rg.GET("/child-keys", h.listAllChildren)
+	rg.GET("/stats/all", h.allStats)
 
 	prices := rg.Group("/prices")
 	{
@@ -93,10 +100,16 @@ func randomHex(n int) string {
 // --- Keys ---
 
 func (h *Handler) listKeys(c *gin.Context) {
-	keys, err := h.stats.ListRootKeys(c.Request.Context())
+	ctx := c.Request.Context()
+	keys, err := h.stats.ListRootKeys(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	// Attach the current-month exhaustion flag for each root.
+	for i := range keys {
+		exhausted, _ := h.redis.IsRootExhausted(ctx, keys[i].ID)
+		keys[i].Exhausted = exhausted
 	}
 	c.JSON(http.StatusOK, keys)
 }
@@ -105,37 +118,41 @@ func (h *Handler) createKey(c *gin.Context) {
 	var body struct {
 		Name     string  `json:"name" binding:"required"`
 		KeyCode  string  `json:"key_code"`
-		ParentID int64   `json:"parent_id"` // -1 = root key (omit or set to -1)
+		ParentID int64   `json:"parent_id"` // legacy: single root; -1 = root key
+		RootIDs  []int64 `json:"root_ids"`  // ordered bound roots (priority = index)
 		QuotaCNY *string `json:"quota_cny"` // yuan string, nil/"" = unlimited
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	ctx := c.Request.Context()
 
 	keyCode := body.KeyCode
 	if keyCode == "" {
 		keyCode = "sk-" + randomHex(24)
 	}
 
-	parentID := body.ParentID
-	if parentID == 0 {
-		parentID = -1 // treat omitted/zero as root key
+	// Resolve the ordered root list. Fall back to legacy parent_id if root_ids omitted.
+	rootIDs := body.RootIDs
+	if len(rootIDs) == 0 && body.ParentID > 0 {
+		rootIDs = []int64{body.ParentID}
 	}
+	rootIDs = dedupInt64(rootIDs) // avoid a PK clash in key_parents
 
-	// Validate parent exists and is itself a root key.
-	if parentID != -1 {
-		parent, err := h.stats.GetKeyByID(c.Request.Context(), parentID)
+	// Validate every bound root exists and is itself a root key.
+	for _, rid := range rootIDs {
+		root, err := h.stats.GetKeyByID(ctx, rid)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "parent key not found"})
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("root key %d not found", rid)})
 			} else {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			}
 			return
 		}
-		if parent.ParentID != -1 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "parent key must be a root key"})
+		if root.ParentID != -1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("key %d must be a root key", rid)})
 			return
 		}
 	}
@@ -150,6 +167,12 @@ func (h *Handler) createKey(c *gin.Context) {
 		quotaCNY = *body.QuotaCNY
 	}
 
+	// parent_id: -1 for root keys, else the primary (first) bound root.
+	parentID := int64(-1)
+	if len(rootIDs) > 0 {
+		parentID = rootIDs[0]
+	}
+
 	key := &stats.APIKey{
 		Name:     body.Name,
 		KeyCode:  keyCode,
@@ -157,25 +180,58 @@ func (h *Handler) createKey(c *gin.Context) {
 		QuotaCNY: quotaCNY,
 		IsActive: true,
 	}
-	if err := h.stats.CreateKey(c.Request.Context(), key); err != nil {
+	if err := h.stats.CreateKey(ctx, key); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Warm the key:code cache. Parent key_code is needed; look it up if this is a sub-key.
-	if key.ParentID != -1 {
-		parent, err := h.stats.GetKeyByID(c.Request.Context(), key.ParentID)
-		if err == nil {
-			h.redis.SetKeyInfo(c.Request.Context(), key.KeyCode, redis.KeyInfo{
-				ID:            key.ID,
-				IsActive:      key.IsActive,
-				QuotaCNY:      key.QuotaCNY,
-				ParentKeyCode: parent.KeyCode,
-			}) //nolint:errcheck
+	// Persist bindings and warm the key:code cache for sub-keys.
+	if len(rootIDs) > 0 {
+		if err := h.stats.SetChildParents(ctx, key.ID, rootIDs); err != nil {
+			// Roll back the just-created key so a binding failure doesn't leave
+			// an orphaned, unusable child row behind.
+			h.stats.DeleteKey(ctx, key.ID) //nolint:errcheck
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
 		}
+		h.warmKeyInfo(ctx, key)
+		key.RootIDs = rootIDs
 	}
 
 	c.JSON(http.StatusCreated, key)
+}
+
+// dedupInt64 returns the input with duplicates removed, preserving first-seen order.
+func dedupInt64(in []int64) []int64 {
+	seen := make(map[int64]struct{}, len(in))
+	out := make([]int64, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+// warmKeyInfo (re)builds the proxy cache entry for a sub-key from its current bindings.
+func (h *Handler) warmKeyInfo(ctx context.Context, key *stats.APIKey) {
+	refs, err := h.stats.GetChildParentRefs(ctx, key.ID)
+	if err != nil {
+		return
+	}
+	parents := make([]redis.ParentRef, 0, len(refs))
+	for _, ref := range refs {
+		parents = append(parents, redis.ParentRef{RootID: ref.RootID, KeyCode: ref.KeyCode})
+	}
+	h.redis.SetKeyInfo(ctx, key.KeyCode, redis.KeyInfo{
+		V:        redis.KeyInfoSchema,
+		ID:       key.ID,
+		IsActive: key.IsActive,
+		QuotaCNY: key.QuotaCNY,
+		Parents:  parents,
+	}) //nolint:errcheck
 }
 
 func (h *Handler) getKey(c *gin.Context) {
@@ -195,6 +251,11 @@ func (h *Handler) getKey(c *gin.Context) {
 	// Attach live used_cny from Redis counter.
 	used, _ := h.redis.GetUsed(c.Request.Context(), key.KeyCode)
 	key.UsedCNY = used
+	if key.ParentID != -1 {
+		key.RootIDs, _ = h.stats.GetChildParents(c.Request.Context(), key.ID)
+	} else {
+		key.Exhausted, _ = h.redis.IsRootExhausted(c.Request.Context(), key.ID)
+	}
 	c.JSON(http.StatusOK, key)
 }
 
@@ -214,14 +275,16 @@ func (h *Handler) updateKey(c *gin.Context) {
 	}
 
 	var body struct {
-		Name     *string `json:"name"`
-		QuotaCNY *string `json:"quota_cny"`
-		IsActive *bool   `json:"is_active"`
+		Name     *string  `json:"name"`
+		QuotaCNY *string  `json:"quota_cny"`
+		IsActive *bool    `json:"is_active"`
+		RootIDs  []int64  `json:"root_ids"` // if non-nil, replaces the child's bound roots (ordered)
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	ctx := c.Request.Context()
 
 	updated := *key
 	if body.Name != nil {
@@ -243,13 +306,52 @@ func (h *Handler) updateKey(c *gin.Context) {
 		updated.IsActive = *body.IsActive
 	}
 
-	if err := h.stats.UpdateKey(c.Request.Context(), &updated); err != nil {
+	if err := h.stats.UpdateKey(ctx, &updated); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// Invalidate cache so proxy picks up the new is_active / quota_cny.
-	h.redis.DeleteKeyInfo(c.Request.Context(), updated.KeyCode) //nolint:errcheck
+
+	// Replace bindings if provided (only meaningful for child keys).
+	if body.RootIDs != nil && updated.ParentID != -1 {
+		rootIDs := dedupInt64(body.RootIDs)
+		for _, rid := range rootIDs {
+			root, err := h.stats.GetKeyByID(ctx, rid)
+			if err != nil || root.ParentID != -1 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("key %d must be an existing root key", rid)})
+				return
+			}
+		}
+		if err := h.stats.SetChildParents(ctx, updated.ID, rootIDs); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		updated.RootIDs = rootIDs
+	} else if updated.ParentID != -1 {
+		updated.RootIDs, _ = h.stats.GetChildParents(ctx, updated.ID)
+	}
+
+	// Invalidate cache so proxy picks up new is_active / quota_cny / bindings.
+	h.redis.DeleteKeyInfo(ctx, updated.KeyCode) //nolint:errcheck
+	// If a ROOT key changed (e.g. toggled active/inactive), every child bound to
+	// it has a stale cached failover list — invalidate them so the proxy rebuilds.
+	if updated.ParentID == -1 {
+		h.invalidateChildrenOfRoot(ctx, updated.ID)
+	}
 	c.JSON(http.StatusOK, &updated)
+}
+
+// invalidateChildrenOfRoot drops the proxy cache entry of every child key bound
+// to the given root so its failover list is rebuilt on the next request.
+func (h *Handler) invalidateChildrenOfRoot(ctx context.Context, rootID int64) {
+	childIDs, err := h.stats.ListChildIDsByRoot(ctx, rootID)
+	if err != nil {
+		return
+	}
+	for _, cid := range childIDs {
+		if ch, err := h.stats.GetKeyByID(ctx, cid); err == nil {
+			h.redis.DeleteKeyInfo(ctx, ch.KeyCode) //nolint:errcheck
+		}
+	}
 }
 
 func (h *Handler) deleteKey(c *gin.Context) {
@@ -268,29 +370,36 @@ func (h *Handler) deleteKey(c *gin.Context) {
 		return
 	}
 
-	// Collect all key_codes to remove from Redis before deleting from MySQL.
-	keyCodes := []string{key.KeyCode}
+	// Collect key_codes whose proxy cache must be invalidated. Deleting a root
+	// unbinds it from its children (no cascade delete), so those children need
+	// their cached failover list rebuilt on next request.
+	invalidate := []string{key.KeyCode}
 	if key.ParentID == -1 {
-		children, err := h.stats.ListChildKeys(ctx, key.ID)
+		childIDs, err := h.stats.ListChildIDsByRoot(ctx, key.ID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		for _, ch := range children {
-			keyCodes = append(keyCodes, ch.KeyCode)
+		for _, cid := range childIDs {
+			if ch, err := h.stats.GetKeyByID(ctx, cid); err == nil {
+				invalidate = append(invalidate, ch.KeyCode)
+			}
 		}
 	}
 
-	// Delete from MySQL (cascades to children via `OR parent_id = ?`).
+	// Delete the key row + its bindings (see stats.DeleteKey — no child cascade).
 	if err := h.stats.DeleteKey(ctx, key.ID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	// Clean up Redis caches.
-	for _, kc := range keyCodes {
+	for _, kc := range invalidate {
 		h.redis.DeleteKeyInfo(ctx, kc) //nolint:errcheck
-		h.redis.DeleteUsed(ctx, kc)    //nolint:errcheck
+	}
+	h.redis.DeleteUsed(ctx, key.KeyCode) //nolint:errcheck
+	if key.ParentID == -1 {
+		h.redis.ClearRootExhausted(ctx, key.ID) //nolint:errcheck
 	}
 
 	c.Status(http.StatusNoContent)
@@ -307,32 +416,147 @@ func (h *Handler) listChildren(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// Attach live used_cny from Redis counters.
+	c.JSON(http.StatusOK, h.enrichChildren(ctx, keys))
+}
+
+// listAllChildren returns every child key (flat), each with its live used_cny and
+// ordered bound root ids.
+func (h *Handler) listAllChildren(c *gin.Context) {
+	ctx := c.Request.Context()
+	keys, err := h.stats.ListAllChildKeys(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, h.enrichChildren(ctx, keys))
+}
+
+// enrichChildren attaches live used_cny and ordered root_ids to each child key.
+func (h *Handler) enrichChildren(ctx context.Context, keys []stats.APIKey) []stats.APIKey {
 	result := make([]stats.APIKey, len(keys))
 	for i, k := range keys {
 		used, _ := h.redis.GetUsed(ctx, k.KeyCode)
 		k.UsedCNY = used
+		k.RootIDs, _ = h.stats.GetChildParents(ctx, k.ID)
 		result[i] = k
 	}
-	c.JSON(http.StatusOK, result)
+	return result
+}
+
+// allStats aggregates daily stats across every child key for the date range.
+func (h *Handler) allStats(c *gin.Context) {
+	ctx := c.Request.Context()
+	start, end, ok := parseStatsRange(c)
+	if !ok {
+		return
+	}
+	children, err := h.stats.ListAllChildKeys(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ids := make([]int64, len(children))
+	for i, ch := range children {
+		ids[i] = ch.ID
+	}
+	rows, err := h.stats.QueryByParent(ctx, ids, start, end)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, rows)
+}
+
+// setRootChildren batch-binds a root key to a set of child keys (checkbox UI on
+// the root side). Children checked get this root appended to their failover list;
+// unchecked ones get it removed.
+func (h *Handler) setRootChildren(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	ctx := c.Request.Context()
+	root, err := h.stats.GetKeyByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if root.ParentID != -1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "not a root key"})
+		return
+	}
+
+	var body struct {
+		ChildIDs []int64 `json:"child_ids"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	childIDs := dedupInt64(body.ChildIDs)
+	for _, cid := range childIDs {
+		ch, err := h.stats.GetKeyByID(ctx, cid)
+		if err != nil || ch.ParentID == -1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("key %d must be an existing child key", cid)})
+			return
+		}
+	}
+
+	affected, err := h.stats.SetRootChildren(ctx, id, childIDs)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// Rebuild the proxy cache for every child whose bindings changed.
+	for _, cid := range affected {
+		if ch, err := h.stats.GetKeyByID(ctx, cid); err == nil {
+			h.redis.DeleteKeyInfo(ctx, ch.KeyCode) //nolint:errcheck
+		}
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// clearExhausted clears a root key's current-month exhaustion flag.
+func (h *Handler) clearExhausted(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	if err := h.redis.ClearRootExhausted(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 const dateFmt = "2006-01-02"
+
+// parseStatsRange reads and validates the start/end query params (defaults: −7d..today).
+func parseStatsRange(c *gin.Context) (start, end string, ok bool) {
+	start = c.DefaultQuery("start", time.Now().AddDate(0, 0, -7).Format(dateFmt))
+	end = c.DefaultQuery("end", time.Now().Format(dateFmt))
+	if _, err := time.Parse(dateFmt, start); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid start date, expected YYYY-MM-DD"})
+		return "", "", false
+	}
+	if _, err := time.Parse(dateFmt, end); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid end date, expected YYYY-MM-DD"})
+		return "", "", false
+	}
+	return start, end, true
+}
 
 func (h *Handler) keyStats(c *gin.Context) {
 	id, ok := parseID(c)
 	if !ok {
 		return
 	}
-	start := c.DefaultQuery("start", time.Now().AddDate(0, 0, -7).Format(dateFmt))
-	end := c.DefaultQuery("end", time.Now().Format(dateFmt))
-
-	if _, err := time.Parse(dateFmt, start); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid start date, expected YYYY-MM-DD"})
-		return
-	}
-	if _, err := time.Parse(dateFmt, end); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid end date, expected YYYY-MM-DD"})
+	start, end, ok := parseStatsRange(c)
+	if !ok {
 		return
 	}
 
@@ -551,7 +775,10 @@ type configExport struct {
 	ModelPrices map[string][]stats.ModelPrice `json:"model_prices"`
 	APIKeys     []stats.APIKey                `json:"api_keys"`
 	DailyStats  []stats.DailyStat             `json:"daily_stats"`
+	KeyParents  []stats.KeyParent             `json:"key_parents"` // added in v2 (many-to-many bindings)
 }
+
+const configVersion = 2
 
 func (h *Handler) exportConfig(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -584,12 +811,19 @@ func (h *Handler) exportConfig(c *gin.Context) {
 		return
 	}
 
+	keyParents, err := h.stats.ListAllKeyParents(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	export := configExport{
-		Version:     1,
+		Version:     configVersion,
 		ExportedAt:  time.Now().UTC().Format(time.RFC3339),
 		ModelPrices: prices,
 		APIKeys:     allKeys,
 		DailyStats:  dailyStats,
+		KeyParents:  keyParents,
 	}
 
 	c.Header("Content-Disposition", `attachment; filename="apiproxy-config.json"`)
@@ -607,7 +841,9 @@ func (h *Handler) importConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if body.Version != 1 {
+	// Accept v1 (single parent_id) and v2 (many-to-many key_parents). For v1,
+	// ImportAll backfills bindings from each key's parent_id.
+	if body.Version != 1 && body.Version != 2 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unsupported config version %d", body.Version)})
 		return
 	}
@@ -622,18 +858,17 @@ func (h *Handler) importConfig(c *gin.Context) {
 
 	// Collect existing key codes BEFORE overwriting so we can fully flush Redis.
 	oldRoots, _ := h.stats.ListRootKeys(ctx)
-	oldKeyCodes := make([]string, 0, len(oldRoots))
+	oldChildren, _ := h.stats.ListAllChildKeys(ctx)
+	oldKeyCodes := make([]string, 0, len(oldRoots)+len(oldChildren))
 	for _, r := range oldRoots {
 		oldKeyCodes = append(oldKeyCodes, r.KeyCode)
-		if children, err := h.stats.ListChildKeys(ctx, r.ID); err == nil {
-			for _, ch := range children {
-				oldKeyCodes = append(oldKeyCodes, ch.KeyCode)
-			}
-		}
+	}
+	for _, ch := range oldChildren {
+		oldKeyCodes = append(oldKeyCodes, ch.KeyCode)
 	}
 	oldModels, _ := h.stats.GetAllModelPrices(ctx)
 
-	if err := h.stats.ImportAll(ctx, body.APIKeys, body.DailyStats, body.ModelPrices); err != nil {
+	if err := h.stats.ImportAll(ctx, body.APIKeys, body.DailyStats, body.ModelPrices, body.KeyParents); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -649,6 +884,10 @@ func (h *Handler) importConfig(c *gin.Context) {
 	for kc := range allKeyCodes {
 		h.redis.DeleteKeyInfo(ctx, kc) //nolint:errcheck
 		h.redis.DeleteUsed(ctx, kc)   //nolint:errcheck
+	}
+	// Clear stale exhaustion flags for previously existing roots.
+	for _, r := range oldRoots {
+		h.redis.ClearRootExhausted(ctx, r.ID) //nolint:errcheck
 	}
 
 	// Restore used_cny counters in Redis from the imported daily_stats.
@@ -721,6 +960,14 @@ func validateImport(body configExport) error {
 		}
 		if d.InputTokens < 0 || d.OutputTokens < 0 || d.CacheWriteTokens < 0 || d.CacheHitTokens < 0 {
 			return fmt.Errorf("daily_stat[%d] has negative token field", i)
+		}
+	}
+	for i, kp := range body.KeyParents {
+		if _, ok := keyIDs[kp.ChildID]; !ok {
+			return fmt.Errorf("key_parents[%d] references unknown child_id %d", i, kp.ChildID)
+		}
+		if _, ok := keyIDs[kp.RootID]; !ok {
+			return fmt.Errorf("key_parents[%d] references unknown root_id %d", i, kp.RootID)
 		}
 	}
 	return nil

@@ -234,15 +234,13 @@ export default function KeysPage() {
                     </div>
                   </td>
                   <td style={tdStyle}>
-                    {k.quota_cny === '-1' || k.quota_cny == null
-                      ? <span style={{ color: '#9ca3af' }}>无限制</span>
-                      : parseFloat(k.quota_cny).toFixed(2)}
+                    <InlineEditQuota value={k.quota_cny} onSave={q => updateMut.mutate({ id: k.id, data: { quota_cny: q } })} />
                   </td>
                   <td style={tdStyle}>{parseFloat(k.used_cny).toFixed(6)}</td>
                   <td style={tdStyle}><ActiveBadge active={k.is_active} /></td>
                   <td style={{ ...tdStyle, whiteSpace: 'nowrap' }}>
                     <div style={{ display: 'flex', gap: 4 }}>
-                      <Btn color="ghost" onClick={() => { setEditingChildId(k.id); setShowCreateChild(false) }}>关联</Btn>
+                      <Btn color="ghost" onClick={() => { setEditingChildId(k.id); setShowCreateChild(false) }}>编辑</Btn>
                       <Btn color="ghost" onClick={() => updateMut.mutate({ id: k.id, data: { is_active: !k.is_active } })}>
                         {k.is_active ? '停用' : '启用'}
                       </Btn>
@@ -729,6 +727,53 @@ function InlineEditName({ value, onSave }: { value: string; onSave: (name: strin
     <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
       <span style={{ fontWeight: 500 }}>{value}</span>
       <button onClick={start} style={iconBtnStyle} title="修改名称"><Pencil size={12} /></button>
+    </div>
+  )
+}
+
+// InlineEditQuota edits a child key's monthly CNY quota in place. An empty value
+// means unlimited (the backend maps "" -> "-1").
+function InlineEditQuota({ value, onSave }: { value: string; onSave: (quotaCny: string) => void }) {
+  const unlimited = !value || value === '-1'
+  const initial = unlimited ? '' : value
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(initial)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const start = () => { setDraft(initial); setEditing(true); setTimeout(() => inputRef.current?.focus(), 0) }
+  const cancel = () => setEditing(false)
+  const save = () => {
+    const trimmed = draft.trim()
+    if (trimmed !== '' && (isNaN(Number(trimmed)) || Number(trimmed) < 0)) { cancel(); return }
+    if (trimmed !== initial) onSave(trimmed) // "" => unlimited
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <input
+          ref={inputRef}
+          type="number"
+          step="0.001"
+          placeholder="留空=无限制"
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') cancel() }}
+          style={{ ...inputStyle, padding: '2px 6px', fontSize: 13, width: 110 }}
+        />
+        <button onClick={save} style={iconBtnStyle} title="保存"><Check size={13} color="#16a34a" /></button>
+        <button onClick={cancel} style={iconBtnStyle} title="取消"><X size={13} /></button>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+      {unlimited
+        ? <span style={{ color: '#9ca3af' }}>无限制</span>
+        : <span>{parseFloat(value).toFixed(2)}</span>}
+      <button onClick={start} style={iconBtnStyle} title="修改配额"><Pencil size={12} /></button>
     </div>
   )
 }
